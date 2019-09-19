@@ -1,0 +1,5 @@
+name = DSS DES API Data Importer
+description = Gets the data from the DES API and saves as an unmanaged text file in public://
+core = 7.x
+package = DSS
+configure = admin/config/services/dss_jobaccess_des_data

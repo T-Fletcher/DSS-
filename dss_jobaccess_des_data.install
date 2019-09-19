@@ -1,0 +1,6 @@
+<?php
+// Uninstall module
+function dss_jobaccess_des_data_uninstall() {
+	variable_del('dss_jobaccess_des_data_key');
+	variable_del('dss_jobaccess_des_itemsCount');
+}

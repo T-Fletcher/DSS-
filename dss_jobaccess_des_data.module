@@ -1,0 +1,507 @@
+<?php 
+
+/* 
+ * DSS JobAccess DES Service Provider API retriever
+ *
+ * Original Author: Tally Tarik  - March  2018
+ * Updated by: 		Tim Fletcher - August 2019
+ *
+ * Dependencies: JobAccess API, managed by the Department of Education
+ * 
+
+This custom module retreives detailed Service Provider information from the JobSearch API. 
+It gathers the data, cleans it up, then saves it in a static file, that is then imported via 
+Feeds (plus some other stuff migrated from Tally's old version). It does this by:
+ 
+	1. Retreiving a SUMMARY of all DESA and DESB providers using 'dss_jobaccess_des_data_getsummary', 
+		once a day just after midnight, then
+
+	2. Saving the summary output in a log file, and for each item in the response (not the log file),
+	   it adds an entry to a DrupalQueue, then
+	
+	3. Every 2 minutes, an Elysia cron task starts processing the queue. This runs the function
+	   'dss_jobaccess_des_data_getdetails_queue_process' that retreives as many detailed results 
+	   as possible in 30 seconds, then closes that Job and starts another for the next batch, 
+	   so as to avoid hogging system resources or causing timeouts. So 30 sec work per 2 minutes.
+
+		3.1. This takes ~1 hour to complete all requests (~6900) on Acquia, or 4 hours locally, and
+			 save them to the final XML file.
+		
+		3.2. Some modifications are made to the XML response before it is saved in the output file;
+			 Adding the RequestID field, stripping malformed tags, whitespace etc.
+		
+		3.3. If the API responds with a non-200 HTTP code when requesting the SUMMARY, it will log
+			 a Watchdgog error (see /admin/reports/dblog, requires the dblog module to be enabled)
+			 and not add anything to the queue or save a file.
+
+		3.4. If the API responds with a non-200 HTTP code when requesting a DETAILED result, we check how
+			 many retrieval attemps have been run via a Drupal variable for that entry. If it's less than 5:
+
+			3.4.1 Bump up the attempt count by +1 and add that entry to the process queue to try again later. Otherwise; 
+		 
+		 	3.4.2 Log a Watchdgog error (see /admin/reports/dblog, requires the dblog module to be enabled)
+		 		  and save an error to /sites/default/files/des_data_details_errors.log. This entry
+		 		  cannot be added to the XML file, so Feeds will see it is missing and delete the corresponding
+		 		  node during the next import.
+
+		3.5. Each time the details function runs, it checks the length of the queue, and a closing XML tag
+			 is added to the file if it's on the last item.
+
+A Drupal cron task (set up using UTC time in Acquia Cloud as of 12 Sept 2019) fires once a day around 4:30am that tells
+Feeds to import the contents of the static file, each entry of which is saved as a DES Service Provider node.
+This task takes ~10 minutes on DEV, or 1 hr locally.
+
+NOTE: Feeds will still successfully import the XML data if the file is not properly closed off with a </Results>
+	  tag, but it will fill the Feed Importer log with errors about it.
+
+
+@TODO: 
+ 
+ 1. Back up/rename the details file rather than delete it, in case the script fails and the CRON job tries
+	to reimport an incomplete file, and deletes the missing Nodes as a result. 
+ 
+  */
+
+/**
+ * Implements hook_menu hook to add our module settings page
+ */
+function dss_jobaccess_des_data_menu() {
+	$items['admin/config/services/dss_jobaccess_des_data'] = array(
+		'title' => 'DSS DES API Data Importer',
+		'description' => 'Settings for the DES API importer.',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('dss_jobaccess_des_data_settings_form'),
+		'access arguments' => array('administer modules'),
+		'type' => MENU_NORMAL_ITEM,
+	);
+	return $items;
+}
+
+/**
+ * Function to return the module settings page
+ */
+function dss_jobaccess_des_data_settings_form($form, &$form_state) {
+	$dss_jobaccess_des_data_key = variable_get('dss_jobaccess_des_data_key');
+	$form['general'] = array(
+		'#type' => 'fieldset',
+		'#title' => t('General Options'),
+		'#tree' => TRUE,
+	);
+	$form['general']['apikey'] = array(
+		'#type' => 'textfield',
+		'#title' => t('API key'),
+		'#default_value' => t($dss_jobaccess_des_data_key),
+		'#description' => t('Your JobActive API key'),
+		'#size' => 50,
+		'#maxlength' => 256,
+	);
+	// Submit button
+	$form['submit'] = array(
+		'#type' => 'submit',
+		'#value' => t('Save settings and clear processing queue'),
+	);
+	return $form;
+}
+
+
+/**
+ * Save function for the module settings page
+ */
+function dss_jobaccess_des_data_settings_form_submit($form, &$form_state) {
+	// Check and Set Variables
+	$dss_jobaccess_des_data_key = $form_state['values']['general']['apikey'];
+	variable_set('dss_jobaccess_des_data_key', $dss_jobaccess_des_data_key);
+	// Clear the processing queue
+	$queue = DrupalQueue::get('dss_jobaccess_des_data_getdetails_queue');
+	$queue->deleteQueue();
+	// Message
+	drupal_set_message('Settings have been saved and processing queue has been cleared');
+}
+
+/**
+ * Implements hook_cronapi to set our cron schedule
+ */
+function dss_jobaccess_des_data_cronapi($op, $job = NULL) {
+	$items['dss_jobaccess_des_data_getsummary'] = array(
+		'description' => 'Get the summary of DES Service Providers and queue processing',
+		'rule' => '5 0 * * *' // Run every morning at 00:05AM
+	);
+	return $items;
+}
+
+/**
+ * Implements hook_cron_queue_info to process our queue. Use Elysia cron to make this run periodically via the UI
+ */
+function dss_jobaccess_des_data_cron_queue_info() {
+	$queues['dss_jobaccess_des_data_getdetails_queue'] = array(
+		'worker callback' => 'dss_jobaccess_des_data_getdetails_queue_process',
+		'time' => 30, // Run for 30 seconds
+	);
+	return $queues;
+}
+
+/**
+ * Implements hook_element_info_alter()
+ * Add additional (!) custom process function
+ */
+function dss_jobaccess_des_data_element_info_alter(&$type) {
+	if (isset($type['geofield_proximity']['#process'])) {
+		$type['geofield_proximity']['#process'][] = 'dss_jobaccess_des_data_proximity_element_process';
+	}
+}
+
+/*
+ * Alter geofield views exposed form, remove distance and unit, add placeholder
+ * 
+ * NOTE: This alters the form everywhere, including in the Views UI. If you want to change
+ *       the proximity/range settings for the FAP location search field, comment 
+ *       out these lines in the dss_jobaccess_des_data_proximity_element_process function below.
+ *		 Once you've made your changes in the UI, you can disable these fields again. 
+ *
+ *       $element['distance']['#access'] = FALSE;
+ *       $element['unit']['#access'] = FALSE;
+ *
+ *       These changes will appear in both the Admin and JobAccess themes.
+ */
+function dss_jobaccess_des_data_proximity_element_process($element, &$form_state, $form) {
+	$element['distance']['#access'] = FALSE;
+	$element['unit']['#access'] = FALSE;
+	$element['origin']['#prefix'] = '';
+	$element['origin']['#size'] = 35;
+	$element['origin']['#title'] = 'Location';
+	$element['origin']['#placeholder'] = 'Search by suburb, postcode or town';
+	
+	// Remove clearfix class
+	unset($element['origin']['#title_display']);
+	
+	return $element;
+}
+
+
+/*
+ * Alter Views exposed filters
+ */
+function dss_jobaccess_des_data_form_alter(&$form, &$form_state, $form_id) {
+
+	// Alter the Find a Provider search form
+	if ($form_id == 'views_exposed_form' && $form_state['view']->name == 'des_service_providers') {
+
+		// Change the placeholder text
+		$form['name']['#attributes']['placeholder'] = t('Search by Service Provider names');
+
+		// Ensure that the proximity search exposed filter is looking for results in Australia
+		if (!empty($form_state['view']->exposed_input)) {
+
+			// Execute the ensure_aus function BEFORE submitting the form. This alters the query if required. 
+			array_unshift($form['#submit'], 'dss_jobaccess_des_data_ensure_aus');
+		}
+	}
+}
+
+
+/*
+ * Call back function from the views_exposed_form to ensure the proximity search exposed filter
+ * is looking for results in Australia, for example, if the user submits only a postcode.
+ */
+function dss_jobaccess_des_data_ensure_aus($form, &$form_state) {
+	
+	// The name of the filter here is specified in the View's 'Admin settings' for the field. 
+	
+	// If NOT empty already, check if the field contains the word 'Australia'. If this fires when the field is 
+	// deliberately left empty, no results will be returned for searches made with other fields.  
+	if ((!strpos($form_state['values']['field_location']['origin'], 'Australia')) && strlen($form_state['values']['field_location']['origin']) != 0) {
+		$form_state['values']['field_location']['origin'] = $form_state['values']['field_location']['origin'] . ' Australia';
+	}
+}
+
+
+/*
+ * Function to check whether a given view is currently filtered, so that we can hide
+ * results if no query has been entered yet.
+ *
+ * Source: lbdan on https://www.drupal.org/node/701144
+ */
+function dss_jobaccess_des_data_is_view_filtered($view, $ensure_not_false = array()) {
+	// If there are no exposed_input variables, nothing has been set
+	if(count($view->exposed_input) == 0) return 0;
+
+	// However, if a user hits 'search' with all empty values, the exposed_input array
+	// is filled with blank values. This will bypass the above check, so let's test for this.
+	foreach ($view->exposed_input as $key => $value) {
+		// Ignore the sort_by key as we don't care if the user has changed the sort order
+		// without entering a search, for some reason.
+		if ($key == 'sort_by') continue;
+
+		// For arrays, we need to recursively check if its keys have any non-false value
+		if (is_array($value)) {
+			if (dss_jobaccess_des_data_does_array_have_non_false_value($value)) return true;
+		}
+		// Otherwise, just check if the value is non-false
+		else if ($value != false) return true;
+	}
+
+	// If we haven't found a non-false value yet, there isn't one! The view is not filtered.
+	return false;
+}
+
+/*
+ * Function to check if an array contains at least one non-false value
+ * Used by the above function to ensure we have at least one filter set for a view
+ */
+function dss_jobaccess_des_data_does_array_have_non_false_value($array) {
+	foreach ($array as $value) {
+		// Recursively check array values
+		if (is_array($value)) $value = dss_jobaccess_des_data_does_array_have_non_false_value($value);
+
+		// Return if we encounter a non-false value
+		if ($value != false) return true;
+	}
+}
+
+
+
+/*
+ * Function to GET the summary from the JobActive API
+ * 
+ * NOTE: The API key saved in the UI must NOT have any URL-encoded characters - enter them literally ie. a '%3D' should be '=''
+ * 		 Also, the CRON job will say it has run successfully even if there is NO API KEY saved, and nothing actually ran. 
+ */
+function dss_jobaccess_des_data_getsummary() {
+	
+	// https://www.hashbangcode.com/article/drupal-7-queues-api
+
+	// Here we set some counters at 0 (as Drupal variables) to capture the number of items to be retreived vs the 
+	// number of times 'dss_jobaccess_des_data_getdetails_queue_process' has been run since the last summary retrieval. 
+	variable_set('dss_jobaccess_des_itemsCount', 0);
+	$dss_jobaccess_des_itemsCount = variable_get('dss_jobaccess_des_itemsCount');
+	$output = '';
+
+	// Errors
+	$summaryImportError = 'ERROR: Unable to complete data import. The API returned a non-200 HTTP response when the summary data was requested, so no summary file was generated. The DES Service Provider content cannot be updated. Check the API key is entered correctly, WITHOUT URL-encoded characters.';
+	$summaryImportApiError = 'ERROR: No API key found, unable to import JobAccess Service Provider summary. Check the API key at <a href="/admin/config/services/dss_jobaccess_des_data">/admin/config/services/dss_jobaccess_des_data</a>';
+	
+	// Check for the presence of the API key. If it's empty, throw an error. The CRON task will report it ran 
+	// successfully regardless of the function outcome, so it can be misleading.
+	if (strlen(variable_get('dss_jobaccess_des_data_key')) == 0) {
+		watchdog('JobAccess DES Data Import', $summaryImportApiError, NULL, WATCHDOG_ERROR, '/admin/config/services/dss_jobaccess_des_data');
+		drupal_set_message(t($summaryImportApiError), 'error');
+		return false;
+	}
+
+	// Replace the details file with a fresh one containing only an opening XML tag, so all details data is loaded in poppin' fresh
+	file_unmanaged_save_data('<Results>', 'public://des_data_details.xml', FILE_EXISTS_REPLACE);
+
+	// Create our request options
+	$options = array(
+		'method' => 'GET',
+		'headers' => array('Content-Type' => 'application/json', 'Accept' => 'application/json')
+	);
+	$url = 'https://jobsearch.gov.au/api/v1/providers' . '?' . drupal_http_build_query(
+		array(
+			'key' => variable_get('dss_jobaccess_des_data_key'),
+			'contractTypeCodes' => array('DESA', 'DESB'),
+		)
+	);
+
+	// Fire off the request to retreive the summary
+	$result = drupal_http_request($url, $options);
+	
+	// If the API returns a non-200 response code, throw an error. Otherwise, carry on. Carry on like nothing really matters.
+	if ((int)$result->code !== 200) {
+		watchdog('JobAccess DES Data Import', $summaryImportError, NULL, WATCHDOG_ERROR, '/admin/config/services/dss_jobaccess_des_data');
+	} else {
+
+		// Decode the JSON response data from the API
+		$result = json_decode($result->data);
+
+		// Treat <Results> JSON object as the unique entries
+		$result = $result->Results;
+		
+		// Delete the existing job queue if there is one 
+		DrupalQueue::get('dss_jobaccess_des_data_getdetails_queue')->deleteQueue('dss_jobaccess_des_data_getdetails_queue');
+		
+		// Create a new one to retreive the full details for each provider in the summary
+		$queue = DrupalQueue::get('dss_jobaccess_des_data_getdetails_queue');
+		
+		// For each result, add an entry to the Drupal Queue and also log it in $output
+		foreach ($result as $outlet) {
+			// Bump up the counter by one for each item to get the final length of the DrupalQueue.
+
+// FOR TESTING
+			// Uncomment this to limit how many items are retreived and added to the DrupalQueue
+			//if ($dss_jobaccess_des_itemsCount <=49) {
+// END TESTING
+				++$dss_jobaccess_des_itemsCount;
+
+				// Rather than save the entire response per entry, only collect the bits we need for the detailed request later;
+				// i.e. sitescode/contractTypeCode/specialtyTypecode > a230/desb/bavi
+				$provider = $outlet->SiteCode . '/' . $outlet->ContractTypeCode . '/' . $outlet->SpecialtyTypeCode;
+				
+				// API refuses requests containing uppercase characters
+				$provider = strtolower($provider);
+
+				// Also strip out any whitespace, as some codes contain spaces in the names. This prevents 400 errors form the API.
+				$provider = preg_replace('/\s+/', '', $provider);
+
+				// Add the item's unique ID string to the queue. This is what allows Drupal to retreive the details 
+				// using dss_jobaccess_des_data_getdetails_queue_process() below. 
+				$queue->createItem($provider);
+
+				// Append the result to the log
+				$output .= $provider . ',';
+// FOR TESTING
+			//}
+// END TESTING
+		}
+
+		// Save the $output as an unmanaged text file.
+		// NOTE: This is only a log; it's the above mentioned queue that actually matters
+		file_unmanaged_save_data($output, 'public://des_data_summary.log', FILE_EXISTS_REPLACE);
+	}
+}
+
+
+/*
+ * Function to process the queue and get the full details. This is called once per entry
+ */
+function dss_jobaccess_des_data_getdetails_queue_process($provider_id) {
+
+	$now = date('Y-m-d H:i:s');
+	$data = '';
+
+	// Get the DrupalQueue length from the number of items previously retreived for the summary. 
+	$queue = DrupalQueue::get('dss_jobaccess_des_data_getdetails_queue');
+	$queueCount = $queue->numberOfItems();
+	$detailedImportError = 'ERROR: Unable to import ' . $provider_id . ' from JobSearch API after 5 attempts. This entry has been removed from the site. Please notify the data owner (The Department of Education)';
+
+	// If the queue is empty, do nothing. 
+	if ($queueCount == 0) {
+		
+		return false;
+
+	} else {
+		// Create our request options
+		
+		// Set up a variable name to use later
+		$itemName = 'dss_jobaccess_des_data_requestid_';
+		$itemName .= str_replace("/", "_", $provider_id);
+
+		// NOTE: 
+		// The API serves JSON by default, however the Feed Importer used in Drupal takes XML only.
+		// We tried importing detailed JSON, but Drupal doesn't like saving raw JSON in fields.
+		// The summary response is fine as JSON, but the detailed response MUST be XML.
+		$options = array(
+			'method' => 'GET',
+			'headers' => array('Content-Type' => 'application/xml', 'Accept' => 'application/xml')
+		);
+
+		// Assemble the URL string to retreive the detailed entry (IncludeSubResources gives us *absolutely* everything)
+		$url = 'https://jobsearch.gov.au/api/v1/providers/' . $provider_id . '?' . drupal_http_build_query(
+			array(
+					'key' => variable_get('dss_jobaccess_des_data_key'),
+					'IncludeSubResources' => 'true',
+				)
+			);
+
+		// Fire off the HTTP requqest to the API
+		// https://api.drupal.org/api/drupal/includes%21common.inc/function/drupal_http_request/7.x
+		$result = drupal_http_request($url, $options);
+		
+		// Depending on the response from the API, do stuff...
+		// If the response is OK, comparing the response code as an integer...
+		if ((int)$result->code === 200) {
+
+			// 	Check for the presence of Drupal variable 'dss_jobaccess_des_data_requestid_<$providerID>'
+			if (null !== variable_get($itemName)) {
+				
+				// Delete it
+				variable_del($itemName);
+			}
+
+			$data = $result->data;
+
+			// Make a few tweaks to the data before logging it.
+			// Add in the RequestID field
+			$data = str_replace("<Address>", "<RequestID>" . $provider_id . "</RequestID><Address>", $result->data);
+
+			// Strip out some crap
+			// 'i:nil=true' attributes can cause errors in Feeds
+			$data = str_replace("i:nil=\"true\" /", "/", $data);
+
+			// '&#xC;' ASCII-encoded strings cause errors in Feeds - https://www.codetable.net/hex/c
+			$data = str_replace("&#xC;", "", $data);
+
+		} else {
+
+			// If a result fails, treat 5 retrieval attempts as confirmation there is an error with that entry, 
+			// rather than a temporary brainfart with the API
+
+			// Check for a Drupal variable called 'dss_jobaccess_des_data_requestid_<$providerID>'. If it exists:
+			if (null !== variable_get($itemName)) {
+
+				// Retrieve its value
+				$count = (int)variable_get($itemName);
+
+				// Increment the counter
+				++$count;
+				variable_set($itemName, $count);
+
+				// If the value is less than 5:
+				if ($count <= 5) {
+
+					// Re-add the item to the queue and try again
+					$queue->createItem($provider_id);
+
+				} else {
+
+					// Otherwise log an error and delete the variable for next time
+
+					watchdog('JobAccess DES Data Import', $detailedImportError, NULL, WATCHDOG_ERROR, '/admin/config/services/dss_jobaccess_des_data');
+				 	file_put_contents('public://des_data_details_errors.log', $now . ' - HTTP response ' . $result->code . ' for ' . $provider_id . ", this has failed 5 times and cannot be retrieved. \r\n", FILE_APPEND);
+
+				 	// Delete the variable once the choice is made to drop that entry, and recreate it again next time
+				 	// This helpsd keep the database light. 
+				 	variable_del($itemName);
+				
+					// @TODO: Add it to a list of failed items (file or variable, not sure yet) to email to the API owner
+				}
+
+			} else {
+			
+				// Otherwise create it and give it a value of '1', as this was the first attempt at retrieval
+				// We only create the variable at this point, as it isn't required if the import succeeds. 
+				variable_set($itemName, 1);
+
+				// Re-add the item to the queue
+				$queue->createItem($provider_id);
+			}
+		}
+
+		// Append the result to the details file, which is finally imported via Feeds using another CRON task.
+
+		// FROM @CHRIS: I think it would be better to give this $output directly into the Feeds module. Instead of writing to a file.
+		// Although we'd then need something else to remove the missing providers. Another DrupalQueue perhaps.
+		
+		// FROM @TIM: This should be possible. Rather than save a static file, Feeds supports importing data from a URL. 
+		// Since one request is fired off per entry anyway, we could potentially run the Feed importer once per entry, using 
+	 	// the request URL to the API as the source URL - but this would potentially cull all other Nodes in the process. 
+	 	// 
+	 	// You'd need a second task that compares the Summary list to the live Nodes somehow... perhaps check the $RequestID field 
+	 	// value of every DES Service Provider Node and see if it's present in the summary log. If it's not, delete it.
+	 	// However, this is essentially duplicating Feed's native functionality for a relatively small benefit.
+
+		file_put_contents('public://des_data_details.xml', $data, FILE_APPEND);
+
+		// Check the number of items left in the queue; if it's just one, we're on the last items and can add the closing XML syntax
+		$queue = DrupalQueue::get('dss_jobaccess_des_data_getdetails_queue');
+		if ($queue->numberOfItems() == 1) {
+
+			// @TODO: When the import process queue is empty:
+
+			// 	Check for the presence of a Failed Items list. If it exists, mail it to the API owners so they are aware of the bug in the data
+
+			file_put_contents('public://des_data_details.xml', '</Results>', FILE_APPEND);
+			file_put_contents('public://des_data_details_errors.log', "\r\n" . $now . ' - IMPORT COMPLETE' . "\r\n", FILE_APPEND);
+		}
+	}
+}
